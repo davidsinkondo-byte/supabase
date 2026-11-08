@@ -1,103 +1,199 @@
----
-id: 'vercel-marketplace'
-title: 'Vercel Marketplace'
-description: 'Manage your Supabase projects directly through Vercel'
----
+-- =====================================================================
+-- SONABEL · PPE — Suivi des congés : schéma Supabase
+-- À exécuter une fois dans Supabase : SQL Editor → New query → coller → Run.
+-- Le script peut être relancé sans perte de données.
+-- =====================================================================
 
-## Overview
+create extension if not exists btree_gist;
 
-The Vercel Marketplace lets you create and manage third-party resources, such as Supabase, from the Vercel platform. Through the Marketplace, Vercel bills you for your Supabase usage, and you sign in to Supabase with your Vercel account. Your Vercel team roles also carry over to your Supabase organization.
+-- ---------------------------------------------------------------------
+-- Gestionnaires autorisés (liste blanche par e-mail).
+-- Un compte Supabase dont l'e-mail n'est pas ici ne voit AUCUNE donnée,
+-- même si les inscriptions publiques ont été laissées ouvertes par erreur.
+-- ---------------------------------------------------------------------
+create table if not exists public.gestionnaires (
+  email      text primary key,
+  nom        text not null default '',
+  created_at timestamptz not null default now()
+);
+alter table public.gestionnaires enable row level security;  -- aucune policy : invisible depuis l'application
+revoke all on public.gestionnaires from anon, authenticated;
 
-When you create an organization and projects through the Vercel Marketplace, they function like those created directly within Supabase. However, the billing is handled through your Vercel account, and you can manage your resources directly from the Vercel dashboard or CLI. The integration also syncs environment variables to your connected Vercel projects.
+create or replace function public.is_gestionnaire() returns boolean
+language sql stable security definer set search_path = public as $$
+  select exists (
+    select 1 from public.gestionnaires g
+    where lower(g.email) = lower(coalesce(auth.jwt() ->> 'email', ''))
+  );
+$$;
 
-For more information, see the [Introducing the Vercel Marketplace](https://vercel.com/blog/introducing-the-vercel-marketplace) blog post.
+create or replace function public.set_updated_at() returns trigger
+language plpgsql as $$ begin new.updated_at := now(); return new; end $$;
 
-## Quickstart
+-- ---------------------------------------------------------------------
+-- Agents
+-- ---------------------------------------------------------------------
+create table if not exists public.agents (
+  id         text primary key,                 -- = matricule (ex. « 2274 W »)
+  matricule  text not null unique,
+  nom        text not null,
+  prenom     text not null default '',
+  fonction   text not null default '',
+  direction  text not null,
+  service    text not null default '',
+  solde      integer not null default 30,      -- jours de congé annuel restants
+  updated_at timestamptz not null default now()
+);
+drop trigger if exists agents_updated_at on public.agents;
+create trigger agents_updated_at before update on public.agents
+  for each row execute function public.set_updated_at();
 
-Set up Supabase on Vercel in one of two ways: deploy a starter template, or install Supabase from the Vercel Marketplace. Both create a Supabase project and sync the following environment variables to your connected Vercel projects:
+alter table public.agents enable row level security;
+revoke all on public.agents from anon;
+grant select, insert, update, delete on public.agents to authenticated;
+drop policy if exists agents_gestionnaires on public.agents;
+create policy agents_gestionnaires on public.agents for all to authenticated
+  using (public.is_gestionnaire()) with check (public.is_gestionnaire());
 
-```
-POSTGRES_URL
-POSTGRES_PRISMA_URL
-POSTGRES_URL_NON_POOLING
-POSTGRES_USER
-POSTGRES_HOST
-POSTGRES_PASSWORD
-POSTGRES_DATABASE
-SUPABASE_SECRET_KEY
-SUPABASE_PUBLISHABLE_KEY
-SUPABASE_URL
-SUPABASE_JWT_SECRET
-NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY
-NEXT_PUBLIC_SUPABASE_URL
-```
+-- ---------------------------------------------------------------------
+-- Demandes de congé
+-- ---------------------------------------------------------------------
+create table if not exists public.demandes (
+  id          uuid primary key default gen_random_uuid(),
+  agent_id    text not null references public.agents(id) on update cascade on delete restrict,
+  type        text not null check (type in ('annuel', 'exceptionnel', 'maternite')),
+  du          date not null,
+  au          date not null,
+  duree       integer not null check (duree > 0),
+  motif       text not null default '',
+  interim     text not null default '',
+  statut      text not null default 'attente' check (statut in ('attente', 'approuve', 'refuse')),
+  solde_apres integer,
+  motif_refus text not null default '',
+  created_at  timestamptz not null default now(),
+  created_by  uuid default auth.uid(),
+  decided_at  date,
+  decided_by  uuid,
+  updated_at  timestamptz not null default now(),
+  constraint demandes_dates check (au >= du),
+  -- Deux demandes non refusées d'un même agent ne peuvent pas se chevaucher,
+  -- même si deux gestionnaires les saisissent au même moment.
+  constraint demandes_sans_chevauchement exclude using gist (
+    agent_id with =, daterange(du, au, '[]') with &&
+  ) where (statut <> 'refuse')
+);
+create index if not exists demandes_agent_idx on public.demandes (agent_id);
+drop trigger if exists demandes_updated_at on public.demandes;
+create trigger demandes_updated_at before update on public.demandes
+  for each row execute function public.set_updated_at();
 
-Your app uses these variables to connect to your database and Supabase APIs.
+alter table public.demandes enable row level security;
+revoke all on public.demandes from anon, authenticated;
+-- Saisie et modification : uniquement les champs de la demande.
+-- Statut, solde et décision ne changent que via les fonctions ci-dessous.
+grant select on public.demandes to authenticated;
+grant insert (agent_id, type, du, au, duree, motif, interim) on public.demandes to authenticated;
+grant update (agent_id, type, du, au, duree, motif, interim) on public.demandes to authenticated;
 
-### Via template
+drop policy if exists demandes_lecture on public.demandes;
+create policy demandes_lecture on public.demandes for select to authenticated
+  using (public.is_gestionnaire());
+drop policy if exists demandes_saisie on public.demandes;
+create policy demandes_saisie on public.demandes for insert to authenticated
+  with check (public.is_gestionnaire());
+drop policy if exists demandes_modification on public.demandes;
+create policy demandes_modification on public.demandes for update to authenticated
+  using (public.is_gestionnaire() and statut = 'attente')
+  with check (public.is_gestionnaire() and statut = 'attente');
 
-<div className="bg-surface-100 py-4 px-5 border rounded-md not-prose">
-  <h4 className="text-foreground">Deploy a Next.js app with Supabase</h4>
-  <p className="text-foreground-light mb-3">Uses the Next.js Supabase starter template</p>
-  <a href="https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fvercel%2Fnext.js%2Ftree%2Fcanary%2Fexamples%2Fwith-supabase&project-name=nextjs-with-supabase&repository-name=nextjs-with-supabase&stores=%5B%7B%22type%22%3A%22integration%22%2C%22integrationSlug%22%3A%22supabase%22%2C%22productSlug%22%3A%22supabase%22%7D%5D">
-    <img src="https://vercel.com/button" alt="Deploy with Vercel" />
-  </a>
-</div>
+-- ---------------------------------------------------------------------
+-- Décisions (atomiques : statut + solde de l'agent dans la même transaction)
+-- ---------------------------------------------------------------------
+create or replace function public.approuver_demande(p_id uuid) returns void
+language plpgsql security definer set search_path = public as $$
+declare d public.demandes; v_solde integer;
+begin
+  if not public.is_gestionnaire() then raise exception 'Accès refusé.' using errcode = '42501'; end if;
+  select * into d from public.demandes where id = p_id for update;
+  if not found then raise exception 'Demande introuvable (supprimée entre-temps ?).'; end if;
+  if d.statut <> 'attente' then raise exception 'Cette demande a déjà été traitée par un autre gestionnaire.'; end if;
+  if d.type = 'annuel' then
+    update public.agents set solde = solde - d.duree where id = d.agent_id returning solde into v_solde;
+  end if;
+  update public.demandes
+     set statut = 'approuve', solde_apres = v_solde, decided_at = current_date,
+         decided_by = auth.uid(), motif_refus = ''
+   where id = p_id;
+end $$;
 
-### Via Vercel Marketplace
+create or replace function public.refuser_demande(p_id uuid, p_motif text default '') returns void
+language plpgsql security definer set search_path = public as $$
+declare d public.demandes; v_solde integer;
+begin
+  if not public.is_gestionnaire() then raise exception 'Accès refusé.' using errcode = '42501'; end if;
+  select * into d from public.demandes where id = p_id for update;
+  if not found then raise exception 'Demande introuvable (supprimée entre-temps ?).'; end if;
+  if d.statut <> 'attente' then raise exception 'Cette demande a déjà été traitée par un autre gestionnaire.'; end if;
+  if d.type = 'annuel' then
+    select solde - d.duree into v_solde from public.agents where id = d.agent_id;
+  end if;
+  update public.demandes
+     set statut = 'refuse', solde_apres = v_solde, decided_at = current_date,
+         decided_by = auth.uid(), motif_refus = coalesce(p_motif, '')
+   where id = p_id;
+end $$;
 
-In the Vercel Marketplace, go to the [Supabase page](https://vercel.com/marketplace/supabase) and click **Install**.
+create or replace function public.remettre_en_attente(p_id uuid) returns void
+language plpgsql security definer set search_path = public as $$
+declare d public.demandes;
+begin
+  if not public.is_gestionnaire() then raise exception 'Accès refusé.' using errcode = '42501'; end if;
+  select * into d from public.demandes where id = p_id for update;
+  if not found then raise exception 'Demande introuvable (supprimée entre-temps ?).'; end if;
+  if d.statut = 'attente' then return; end if;
+  if d.statut = 'approuve' and d.type = 'annuel' then
+    update public.agents set solde = solde + d.duree where id = d.agent_id;
+  end if;
+  -- Une demande refusée qui redevient active peut entrer en conflit (contrainte de chevauchement).
+  update public.demandes
+     set statut = 'attente', solde_apres = null, decided_at = null, decided_by = null, motif_refus = ''
+   where id = p_id;
+end $$;
 
-## Studio support
+create or replace function public.supprimer_demande(p_id uuid) returns void
+language plpgsql security definer set search_path = public as $$
+declare d public.demandes;
+begin
+  if not public.is_gestionnaire() then raise exception 'Accès refusé.' using errcode = '42501'; end if;
+  select * into d from public.demandes where id = p_id for update;
+  if not found then return; end if;
+  if d.statut = 'approuve' and d.type = 'annuel' then
+    update public.agents set solde = solde + d.duree where id = d.agent_id;
+  end if;
+  delete from public.demandes where id = p_id;
+end $$;
 
-To open Supabase Studio from the Vercel dashboard, start from either of the following tabs. Each one opens a different page in Supabase:
+revoke execute on function public.approuver_demande(uuid), public.refuser_demande(uuid, text),
+  public.remettre_en_attente(uuid), public.supprimer_demande(uuid), public.is_gestionnaire()
+  from public, anon;
+grant execute on function public.approuver_demande(uuid), public.refuser_demande(uuid, text),
+  public.remettre_en_attente(uuid), public.supprimer_demande(uuid), public.is_gestionnaire()
+  to authenticated;
 
-- **Integrations** tab: Next to Supabase, click **Manage**, then click **Open in Supabase**. The Supabase Dashboard homepage opens.
-- **Storage** tab: Select your Supabase project, then click **Open in Supabase**. That project opens in the Supabase Dashboard.
+-- ---------------------------------------------------------------------
+-- Temps réel : chaque gestionnaire voit les changements des autres immédiatement
+-- ---------------------------------------------------------------------
+do $$ begin
+  alter publication supabase_realtime add table public.agents;
+exception when duplicate_object then null; end $$;
+do $$ begin
+  alter publication supabase_realtime add table public.demandes;
+exception when duplicate_object then null; end $$;
 
-Supabase Studio provides tools such as:
-
-- **SQL Editor**: Run SQL queries against your database.
-- **Table Editor**: Create, edit, and delete tables and columns.
-- **Log Explorer**: Inspect real-time logs for your database.
-- **Postgres Upgrades**: Upgrade the Postgres version of your database.
-- **Compute Upgrades**: Scale the compute resources allocated to your database.
-
-## How your Vercel team maps to Supabase
-
-There is a direct one-to-one relationship between a Supabase organization and a Vercel team. Installing the integration or launching your first Supabase project through Vercel triggers the creation of a corresponding Supabase organization if one doesn't already exist.
-
-When Vercel users interact with Supabase, they are automatically assigned Supabase accounts. New users get a Supabase account linked to their primary email, while existing users have their Vercel and Supabase accounts linked.
-
-- The user who creates the Supabase database from the Vercel dashboard is assigned the `owner` role in the new Supabase organization.
-- Subsequent users are assigned roles based on their Vercel role, such as `developer` for `member` and `owner` for `owner`.
-
-Role management is handled directly in the Vercel dashboard, and changes are synchronized with Supabase.
-
-<Admonition type="note">
-
-Permissions for users who aren't on your Vercel team don't sync with Vercel. You can still invite them to your Supabase organization.
-
-</Admonition>
-
-## Pricing
-
-Pricing for databases created through the Vercel Marketplace is identical to pricing for databases created directly in Supabase. For more information, see [Supabase pricing](/pricing).
-
-The [usage page](/dashboard/org/_/usage) tracks the usage of your Vercel databases, with this information sent to Vercel for billing, which appears on your Vercel invoice.
-
-<Admonition type="caution">
-
-Changing your plan resets your Supabase billing cycle to start on the day of the change. Your Supabase organization's billing cycle is separate from Vercel's, and the first cycle starts on the day you install the integration.
-
-</Admonition>
-
-## Limitations
-
-When you use the Vercel Marketplace, the following limitations apply:
-
-- Projects can only be created from the Vercel dashboard. To create one, see [Quickstart](#quickstart).
-- Organizations are removed only when you [delete all their projects](/kb/troubleshooting/how-to-delete-vercel-linked-projects-9d08aa) and then uninstall the Vercel Marketplace integration.
-- Owners can't be added in the Supabase Dashboard. To make someone an owner, give them the `owner` role on your Vercel team. For how roles map between Vercel and Supabase, see [How your Vercel team maps to Supabase](#how-your-vercel-team-maps-to-supabase).
-- Invoices and payments are managed in the Vercel dashboard, not in the Supabase Dashboard. For how your Supabase usage reaches your Vercel invoice, see [Pricing](#pricing).
-- [Custom domains](/docs/guides/platform/custom-domains) aren't supported. The Vercel environment variables always use your project's base `SUPABASE_URL`.
+-- ---------------------------------------------------------------------
+-- À ADAPTER : e-mails des gestionnaires autorisés (un par ligne)
+-- ---------------------------------------------------------------------
+-- insert into public.gestionnaires (email, nom) values
+--   ('prenom.nom@sonabel.bf', 'Service RH — PPE'),
+--   ('autre.gestionnaire@sonabel.bf', 'Nom Prénom')
+-- on conflict (email) do nothing;
